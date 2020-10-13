@@ -202,6 +202,11 @@ class PretrainArguments:
         metadata={"help": "Loss scaling, positive power of 2 values can improve fp16 convergence."}
     )
 
+    deepspeed_zero_stage: Optional[int] = field(
+        default=0,
+        metadata={"help": "Deepspeed Zero Stage. 0 => disabled"}
+    )
+
     log_freq: Optional[float] = field(
         default=1.0,
         metadata={"help": "frequency of logging loss."}
@@ -263,7 +268,7 @@ class PretrainArguments:
     # this argument is test specific. to run a full bert model will take too long to run. instead, we reduce
     # number of hidden layers so that it can show convergence to an extend to help detect any regression.
     force_num_hidden_layers: Optional[int] = field(
-        default=2,
+        default=None,
         metadata={"help": "Whether to use fp16 gradient accumulators."}
     )
 
@@ -324,7 +329,7 @@ def prepare_model(args, device):
                                                 'world_size': args.world_size,
                                                 'local_rank': args.local_rank,
                                                 'allreduce_post_accumulation': True,
-                                                'deepspeed_zero_optimization': {'stage': 1}},
+                                                'deepspeed_zero_optimization': {'stage': args.deepspeed_zero_stage}},
                                             'lr_scheduler': lr_scheduler
                                             })
 
@@ -432,12 +437,12 @@ def do_pretrain(args):
 
 class ORTBertPretrainTest(unittest.TestCase):
     def setUp(self):
-        self.output_dir = './'
+        self.output_dir = '/bert_data/hf_data/test_out/bert_pretrain_results'
         self.bert_model = 'bert-base-uncased'
         self.local_rank = -1
         self.world_rank = -1
         self.world_size = 1
-        self.max_steps = 10
+        self.max_steps = 300000
         self.learning_rate = 5e-4
         self.max_seq_length = 32
         self.max_predictions_per_seq = 20
@@ -487,27 +492,58 @@ class ORTBertPretrainTest(unittest.TestCase):
         do_pretrain(args)
 
     def test_pretrain_convergence(self):
-        # self.max_steps = 200
-        # self.force_num_hidden_layers = 8
-        # args = PretrainArguments(
-        #     output_dir=self.output_dir,
-        #     bert_model=self.bert_model,
-        #     local_rank=self.local_rank,
-        #     world_rank=self.world_rank,
-        #     world_size=self.world_size,
-        #     max_steps=self.max_steps,
-        #     learning_rate=self.learning_rate,
-        #     max_seq_length=self.max_seq_length,
-        #     max_predictions_per_seq=self.max_predictions_per_seq,
-        #     train_batch_size=self.train_batch_size,
-        #     gradient_accumulation_steps=self.gradient_accumulation_steps,
-        #     input_dir=self.input_dir,
-        #     fp16=self.fp16,
-        #     allreduce_post_accumulation=self.allreduce_post_accumulation,
-        #     force_num_hidden_layers=self.force_num_hidden_layers)
-        # final_loss = do_pretrain(args)
-        # return final_loss
-        return None
+        self.max_steps = 200
+        self.force_num_hidden_layers = 8
+        args = PretrainArguments(
+            output_dir=self.output_dir,
+            bert_model=self.bert_model,
+            local_rank=self.local_rank,
+            world_rank=self.world_rank,
+            world_size=self.world_size,
+            max_steps=self.max_steps,
+            learning_rate=self.learning_rate,
+            max_seq_length=self.max_seq_length,
+            max_predictions_per_seq=self.max_predictions_per_seq,
+            train_batch_size=self.train_batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            input_dir=self.input_dir,
+            fp16=self.fp16,
+            allreduce_post_accumulation=self.allreduce_post_accumulation,
+            force_num_hidden_layers=self.force_num_hidden_layers)
+        final_loss = do_pretrain(args)
+        return final_loss
+    
+    def test_pretrain_zero(self):
+        per_gpu_batch_size = 32
+        optimization_batch_size = per_gpu_batch_size*self.world_size # set to disable grad accumulation
+        
+        self.train_batch_size = optimization_batch_size
+        self.gradient_accumulation_steps = 1
+        self.deepspeed_zero_stage = 1
+        self.force_num_hidden_layers = 2
+        self.output_dir = './'
+        self.max_seq_length = 32
+        # only to run on  optimization step because we only want to make sure there is no throughput regression
+        self.max_steps = 50
+        args = PretrainArguments(
+            output_dir=self.output_dir,
+            bert_model=self.bert_model,
+            local_rank=self.local_rank,
+            world_rank=self.world_rank,
+            world_size=self.world_size,
+            max_steps=self.max_steps,
+            learning_rate=self.learning_rate,
+            max_seq_length=self.max_seq_length,
+            max_predictions_per_seq=self.max_predictions_per_seq,
+            train_batch_size=self.train_batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            input_dir=self.input_dir,
+            fp16=self.fp16,
+            allreduce_post_accumulation=self.allreduce_post_accumulation,
+            force_num_hidden_layers=self.force_num_hidden_layers
+            deepspeed_zero_stage = self.deepspeed_zero_stage)
+        final_loss = do_pretrain(args)
+        return final_loss
 
 
 # to do parallel training:
@@ -531,12 +567,18 @@ if __name__ == "__main__":
             logger.info("running ORTBertPretrainTest.test_pretrain_throughput()...")
             test.test_pretrain_throughput()
             logger.info("ORTBertPretrainTest.test_pretrain_throughput() passed")
-        else:
+        elif sys.argv[-1] == 'ORTBertPretrainTest.test_pretrain_convergence':
             logger.info("running ORTBertPretrainTest.test_pretrain_convergence()...")
             final_loss = test.test_pretrain_convergence()
             logger.info("ORTBertPretrainTest.test_pretrain_convergence() final loss = %f", final_loss)
-            # test.assertLess(final_loss, 8.5)
+            test.assertLess(final_loss, 8.5)
             logger.info("ORTBertPretrainTest.test_pretrain_convergence() passed")
+        else:
+            logger.info("running ORTBertPretrainTest.test_pretrain_zero()...")
+            final_loss = test.test_pretrain_zero()
+            logger.info("ORTBertPretrainTest.test_pretrain_zero() final loss = %f", final_loss)
+            test.assertLess(final_loss, 8.5)
+            logger.info("ORTBertPretrainTest.test_pretrain_zero() passed")
     else:
         unittest.main()
 
